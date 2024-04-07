@@ -1,3 +1,4 @@
+use std::f32::NAN;
 use std::str::FromStr;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -159,6 +160,12 @@ pub enum UnifiedExpressions {
                      NeckFlexRight, // Flexes the Right side of the neck and face (causes the right corner of the face to stretch towards.)
                      NeckFlexLeft, // Flexes the left side of the neck and face (causes the left corner of the face to stretch towards.)
                      */
+
+    // Params used for VRCFT Eye tracking
+    EyeLeftX,
+    EyeRightX,
+    EyeLeftY,
+    EyeRightY,
 }
 
 #[allow(unused)]
@@ -168,6 +175,7 @@ pub enum CombinedExpression {
     EyeLidLeft,
     EyeLidRight,
     EyeLid,
+    EyeY,
     EyeSquint,
     JawX,
     JawZ,
@@ -328,18 +336,36 @@ pub type UnifiedExpressionShape = f32;
 pub struct UnifiedTrackingData {
     pub eye: UnifiedEyeData,
     pub shapes: [UnifiedExpressionShape; NUM_SHAPES],
+    combined_overrides: [UnifiedExpressionShape; CombinedExpression::COUNT]
 }
 
 impl UnifiedTrackingData {
     pub fn new() -> Self {
-        Self {
+        let mut this = Self {
             eye: UnifiedEyeData::default(),
             shapes: [0.0; NUM_SHAPES],
-        }
+            combined_overrides: [NAN; CombinedExpression::COUNT],
+        };
+        this.eye.left.pupil_diameter_mm = 0.5;
+        this.eye.right.pupil_diameter_mm = 0.5;
+        this
     }
 
-    pub fn load_single_unified_expression(&mut self, param: UnifiedExpressions, value: f32){
-        self.shapes[param as usize] = value;
+    pub fn load_single_unified_expression(&mut self, param: usize, value: f32){
+        self.shapes[param] = value;
+    }
+
+    pub fn load_combined_expression_override(&mut self, param: usize, value: f32){
+        self.combined_overrides[param] = value;
+    }
+
+    pub fn apply_combined_overrides(&mut self){
+        for idx in 0..(CombinedExpression::COUNT){
+            if !self.combined_overrides[idx].is_nan(){
+                let z = UnifiedExpressions::COUNT;
+                self.shapes[z + idx] = self.combined_overrides[idx];
+            }
+        }
     }
 
     pub fn load_face(&mut self, face_fb: &Vec<f32>) {
@@ -368,7 +394,7 @@ impl UnifiedTrackingData {
             * 0.5;
         self.eye.right.gaze.y =
             (face_fb[FaceFb::EyesLookUpR as usize] - face_fb[FaceFb::EyesLookDownR as usize]) * 0.5;
-        self.eye.combined.gaze = (self.eye.left.gaze + self.eye.right.gaze) * 0.5;
+        
 
         self.eye.left.pupil_diameter_mm = 0.5;
         self.eye.right.pupil_diameter_mm = 0.5;
@@ -522,6 +548,7 @@ impl UnifiedTrackingData {
     }
 
     pub fn calc_combined(&mut self) {
+        self.eye.combined.gaze = (self.eye.left.gaze + self.eye.right.gaze) * 0.5;
         // Combined
         let z = UnifiedExpressions::COUNT;
         self.shapes[z + CombinedExpression::EyeLidLeft as usize] = self.eye.left.openness * 0.75
@@ -534,6 +561,9 @@ impl UnifiedTrackingData {
             [z + CombinedExpression::EyeLidLeft as usize]
             + self.shapes[z + CombinedExpression::EyeLidRight as usize])
             * 0.5;
+
+        self.shapes[z + CombinedExpression::EyeY as usize] = self.shapes[UnifiedExpressions::EyeLeftY as usize] * 0.5 +
+            self.shapes[UnifiedExpressions::EyeRightY as usize] * 0.5;
 
         self.shapes[z + CombinedExpression::EyeSquint as usize] = (self.shapes
             [UnifiedExpressions::EyeSquintLeft as usize]
@@ -761,16 +791,36 @@ pub struct ExtTracking {
     params: [Option<MysteryParam>; NUM_SHAPES],
 }
 
+enum BabbleEventType {
+    UnifiedExpression,
+    Eye
+}
+
+enum EyeValue{
+    LeftEyeX,
+    RightEyeX,
+    EyesY,
+    EyesX,
+    EyeLeftY,
+    EyeRightY,
+    LeftEyeLidExpandedSqueeze,
+    RightEyeLidExpandedSqueeze,
+    EyeLid,
+    EyeLidLeft,
+    EyeLidRight,
+}
 struct BabbleEvent{
-    pub expression: UnifiedExpressions,
-    pub value: f32
+    pub expression: usize,
+    pub value: f32,
+    pub event_type: BabbleEventType
 }
 
 impl BabbleEvent{
     pub fn new() -> Self{
         Self{
-            expression: UnifiedExpressions::EyeSquintLeft,
-            value: 0.0
+            expression: UnifiedExpressions::EyeSquintLeft as usize,
+            value: 0.0,
+            event_type: BabbleEventType::UnifiedExpression
         }
     }
 }
@@ -891,13 +941,86 @@ impl ExtTracking {
                 // HTC: ignored
             }
         }
-
+        let mut eyes_updated: bool = false;
         for babble in self.babble_receiver.try_iter(){
-            self.face.load_single_unified_expression(babble.expression, babble.value)
+            match babble.event_type{
+                BabbleEventType::UnifiedExpression =>{
+                    self.face.load_single_unified_expression(babble.expression, babble.value)
+                },
+
+                BabbleEventType::Eye => {
+                    eyes_updated = true;
+                    // using match is probably somehow possible, but I couldn't get it to work
+                    if babble.expression == EyeValue::LeftEyeX as usize{
+                        self.face.eye.left.gaze.x = babble.value;
+                        self.face.load_single_unified_expression(UnifiedExpressions::EyeLeftX as usize, babble.value);
+                    }
+                    if babble.expression == EyeValue::RightEyeX as usize{
+                        self.face.eye.right.gaze.x = babble.value;
+                        self.face.load_single_unified_expression(UnifiedExpressions::EyeRightX as usize, babble.value);
+                    }
+                    if babble.expression == EyeValue::EyesY as usize{
+                        self.face.eye.left.gaze.y = babble.value;
+                        self.face.eye.right.gaze.y = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeY as usize, babble.value);
+                    }
+                    if babble.expression == EyeValue::EyesX as usize{
+                        self.face.eye.left.gaze.x = babble.value;
+                        self.face.eye.right.gaze.x = babble.value;
+                        self.face.load_single_unified_expression(UnifiedExpressions::EyeLeftX as usize, babble.value);
+                        self.face.load_single_unified_expression(UnifiedExpressions::EyeRightX as usize, babble.value);
+                    }
+                    if babble.expression == EyeValue::EyeLeftY as usize{
+                        self.face.eye.left.gaze.y = babble.value;
+                        self.face.load_single_unified_expression(UnifiedExpressions::EyeLeftY as usize, babble.value);
+                        self.face.load_combined_expression_override(CombinedExpression::EyeY as usize, NAN);    // remove the override
+                    }
+                    if babble.expression == EyeValue::EyeRightY as usize{
+                        self.face.eye.left.gaze.y = babble.value;
+                        self.face.load_single_unified_expression(UnifiedExpressions::EyeRightY as usize, babble.value);
+                        self.face.load_combined_expression_override(CombinedExpression::EyeY as usize, NAN);    // remove the override
+                    }
+                    if babble.expression == EyeValue::LeftEyeLidExpandedSqueeze as usize{
+                        self.face.eye.left.openness = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLid as usize, NAN);
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLidLeft as usize, NAN);
+                    }
+                    if babble.expression == EyeValue::RightEyeLidExpandedSqueeze as usize{
+                        self.face.eye.right.openness = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLid as usize, NAN);
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLidRight as usize, NAN);
+                    }
+                    if babble.expression == EyeValue::EyeLidLeft as usize{
+                        self.face.eye.left.openness = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLidLeft as usize, babble.value);
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLid as usize, NAN);
+                    }
+                    if babble.expression == EyeValue::EyeLidRight as usize{
+                        self.face.eye.right.openness = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLidRight as usize, babble.value);
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLid as usize, NAN);
+                    }
+                    if babble.expression == EyeValue::EyeLid as usize{
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLid as usize, babble.value);
+
+                        // also set the individual values
+                        self.face.eye.right.openness = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLidRight as usize, babble.value);
+                        self.face.eye.left.openness = babble.value;
+                        self.face.load_combined_expression_override(CombinedExpression::EyeLidLeft as usize, babble.value);
+                    }
+                }
+            }
+             
         }
         self.face.calc_combined();
+        self.face.apply_combined_overrides();
 
         self.face.apply_to_bundle(&self.params, bundle);
+
+        if eyes_updated{
+            
+        }
 
         if let Some(left_euler) = self.latest.eye_gazes[0]
             .as_ref()
@@ -1057,15 +1180,26 @@ fn receive_babble_osc(sender: &mut SyncSender<Box<BabbleEvent>>) -> Option<()>{
                     warn!("Babble OSC Message has no args?");
                 } else {
                     if let OscType::Float(x) = packet.args[0]{
-                        if let Some(index) = get_unified_expression_from_str(packet.addr){
+                        // if there are any more parameter types besides babble and ETVR, this is gonna be a mess if still done this way
+                        if let Some(index) = get_unified_expression_from_str(&packet.addr){
                             // I have no idea if this is a good way to do it or not, probably not
                             let mut event = Box::new(BabbleEvent::new());
-                            event.expression = index;
+                            event.expression = index as usize;
                             event.value = x;
+                            event.event_type = BabbleEventType::UnifiedExpression;
                             if let Err(e) = sender.try_send(event) {
                                 warn!("Failed to send babble message: {}", e);
                             }
                         } else {
+                            // could still be ETVR parameters
+                            if let Some(index) = get_etvr_from_str(&packet.addr){
+                                let event = Box::new(BabbleEvent{expression: index as usize, value: x, event_type: BabbleEventType::Eye});
+                                if let Err(e) = sender.try_send(event) {
+                                    warn!("Failed to send babble message: {}", e);
+                                }
+                            } else {
+                                debug!("Babble OSC address {} not implemented!", packet.addr);
+                            }
                         }
                     } else {
                         warn!("Babble OSC: Unsupported arg {:?}", packet.args[0]);
@@ -1076,7 +1210,55 @@ fn receive_babble_osc(sender: &mut SyncSender<Box<BabbleEvent>>) -> Option<()>{
     }
 }
 
-fn get_unified_expression_from_str(addr : String ) -> Option<UnifiedExpressions>{
+fn get_etvr_from_str(addr : &str) -> Option<EyeValue>{
+    match addr{
+        // v1
+        "/avatar/parameters/RightEyeX" =>
+            Some(EyeValue::RightEyeX),
+        
+        "/avatar/parameters/LeftEyeX" =>
+            Some(EyeValue::LeftEyeX),
+        
+        "/avatar/parameters/EyesY" =>
+            Some(EyeValue::EyesY),
+        
+        "/avatar/parameters/RightEyeLidExpandedSqueeze" =>
+            Some(EyeValue::RightEyeLidExpandedSqueeze),
+
+        "/avatar/parameters/LeftEyeLidExpandedSqueeze" =>
+            Some(EyeValue::LeftEyeLidExpandedSqueeze),
+
+        // v2
+        "/avatar/parameters/v2/EyeRightX" =>
+            Some(EyeValue::RightEyeX),
+        
+        "/avatar/parameters/v2/EyeLeftX" =>
+            Some(EyeValue::LeftEyeX),
+
+        "/avatar/parameters/v2/EyeRightY" =>
+            Some(EyeValue::EyeRightY),
+        
+        "/avatar/parameters/v2/EyeLeftY" =>
+            Some(EyeValue::EyeLeftY),
+
+        "/avatar/parameters/v2/EyeLidLeft" =>
+            Some(EyeValue::EyeLidLeft),
+
+        "/avatar/parameters/v2/EyeLidRight" =>
+            Some(EyeValue::EyeLidRight),
+
+        "/avatar/parameters/v2/EyeLid" =>
+            Some(EyeValue::EyeLid),
+
+        "/avatar/parameters/v2/EyeX" =>
+            Some(EyeValue::EyesX),
+        "/avatar/parameters/v2/EyeY" =>
+            Some(EyeValue::EyesY),
+        _=> None
+    }
+}
+
+fn get_unified_expression_from_str(addr : &str ) -> Option<UnifiedExpressions>{
     if addr == "/cheekPuffLeft"{
         return Some(UnifiedExpressions::CheekPuffLeft);
     }
@@ -1213,7 +1395,7 @@ fn get_unified_expression_from_str(addr : String ) -> Option<UnifiedExpressions>
     if addr == "/mouthPressRight"{
         return Some(UnifiedExpressions::MouthPressRight);
     }
-    warn!("Babble OSC address {} not implemented!", addr);
+    
     return None;
 }
 
